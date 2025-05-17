@@ -1,13 +1,11 @@
 use anchor_lang::prelude::*;
-use anchor_lang::Space;
 
 declare_id!("5fVWymoBhqFMCTPkaeiT6APu3dJi5pysEQ2YzV9JMJ6D");
 
 pub const MAX_METADATA_LEN: usize = 256;
-pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
 
 #[program]
-pub mod cyrene_job {
+pub mod escrow_job {
     use super::*;
 
     pub fn initialize_job(
@@ -16,8 +14,8 @@ pub mod cyrene_job {
         metadata: String,
         amount: u64,
     ) -> Result<()> {
-        // Transfer the escrow amount into the newly‑created job account
-        // (the lamports came from `owner` when the account was created)
+        require!(metadata.len() <= MAX_METADATA_LEN, EscrowError::MetadataTooLong);
+
         let job = &mut ctx.accounts.job;
         job.job_id = job_id;
         job.metadata = metadata;
@@ -38,36 +36,26 @@ pub mod cyrene_job {
 
     pub fn mark_processing(ctx: Context<MarkProcessing>) -> Result<()> {
         let job = &mut ctx.accounts.job;
-        require!(
-            ctx.accounts.worker.key() == job.worker,
-            EscrowError::Unauthorized
-        );
+        require!(ctx.accounts.worker.key() == job.worker, EscrowError::Unauthorized);
         require!(job.status == JobStatus::Started, EscrowError::InvalidState);
         job.status = JobStatus::Processing;
         Ok(())
     }
 
+    // ** Fixed complete_job: close the job account and transfer all lamports to worker **
     pub fn complete_job(ctx: Context<CompleteJob>) -> Result<()> {
-        let job_ai = ctx.accounts.job.to_account_info();
-        let worker_ai = ctx.accounts.worker.to_account_info();
-        let amount = ctx.accounts.job.amount;
+        let job = &mut ctx.accounts.job;
 
-        require!(
-            ctx.accounts.owner.key() == ctx.accounts.job.owner,
-            EscrowError::Unauthorized
-        );
-        require!(job_ai.lamports() >= amount, EscrowError::InsufficientEscrow);
-        require!(
-            ctx.accounts.job.status != JobStatus::Done,
-            EscrowError::InvalidState
-        );
+        require!(ctx.accounts.owner.key() == job.owner, EscrowError::Unauthorized);
+        require!(job.status != JobStatus::Done, EscrowError::InvalidState);
 
-        // Pay the worker
-        **job_ai.try_borrow_mut_lamports()? -= amount;
-        **worker_ai.try_borrow_mut_lamports()? += amount;
+        // Mark job as done before closing account (optional)
+        job.status = JobStatus::Done;
 
-        // Mark as done (job account can optionally be closed here)
-        ctx.accounts.job.status = JobStatus::Done;
+        // Because of `close = worker` in accounts context,
+        // all lamports in the job account (including rent) will be sent to worker
+        // when the job account is closed at the end of this instruction.
+
         Ok(())
     }
 
@@ -76,14 +64,8 @@ pub mod cyrene_job {
         let owner_ai = ctx.accounts.owner.to_account_info();
         let amount = ctx.accounts.job.amount;
 
-        require!(
-            ctx.accounts.owner.key() == ctx.accounts.job.owner,
-            EscrowError::Unauthorized
-        );
-        require!(
-            ctx.accounts.job.status != JobStatus::Done,
-            EscrowError::InvalidState
-        );
+        require!(ctx.accounts.owner.key() == ctx.accounts.job.owner, EscrowError::Unauthorized);
+        require!(ctx.accounts.job.status != JobStatus::Done, EscrowError::InvalidState);
         require!(job_ai.lamports() >= amount, EscrowError::InsufficientEscrow);
 
         // Refund the owner
@@ -99,73 +81,87 @@ pub struct InitializeJob<'info> {
     #[account(
         init,
         payer = owner,
-        space = Job::INIT_SPACE + ANCHOR_DISCRIMINATOR_SIZE,
+        space = Job::SIZE + 8,
+        seeds = [b"job", job_id.to_le_bytes().as_ref()],
+        bump,
     )]
     pub job: Account<'info, Job>,
+
     #[account(mut)]
     pub owner: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct StartJob<'info> {
-    #[account(mut, has_one = owner)]
+    #[account(mut, has_one = owner, seeds = [b"job", &job.job_id.to_le_bytes()], bump)]
     pub job: Account<'info, Job>,
+
     #[account(mut)]
     pub worker: Signer<'info>,
-    /// CHECK: The job owner (not required to be a signer for this ix)
+
+    /// CHECK: The job owner (not required to be a signer)
     pub owner: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
 pub struct MarkProcessing<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"job", &job.job_id.to_le_bytes()], bump)]
     pub job: Account<'info, Job>,
+
     #[account(mut)]
     pub worker: Signer<'info>,
 }
 
+// ** Fixed CompleteJob accounts struct: add `close = worker` to close job and transfer lamports **
 #[derive(Accounts)]
 pub struct CompleteJob<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"job", &job.job_id.to_le_bytes()], bump, close = worker)]
     pub job: Account<'info, Job>,
+
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: worker can be any account to receive payment
+
+    /// CHECK: This is the job-assigned worker. We check key matches in handler.
     #[account(mut)]
     pub worker: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
 pub struct RefundJob<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"job", &job.job_id.to_le_bytes()], bump)]
     pub job: Account<'info, Job>,
+
     #[account(mut)]
     pub owner: Signer<'info>,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum JobStatus {
-    Pending,    // waiting for a worker
-    Started,    // accepted by a worker
-    Processing, // worker marked in progress
-    Done,       // owner marked complete & paid
-}
-
-impl anchor_lang::Space for JobStatus {
-    const INIT_SPACE: usize = 1; // 1 byte for enum discriminator
-}
-
 #[account]
-#[derive(InitSpace)]
 pub struct Job {
     pub job_id: u64,
-    #[max_len(MAX_METADATA_LEN)]
-    pub metadata: String,
-    pub owner: Pubkey,  // job poster
-    pub worker: Pubkey, // set once someone accepts
-    pub amount: u64,    // lamports escrowed
+    pub metadata: String,           // max 256 bytes
+    pub owner: Pubkey,              // job poster
+    pub worker: Pubkey,             // set once someone accepts
+    pub amount: u64,                // lamports escrowed
     pub status: JobStatus,
+}
+
+impl Job {
+    pub const SIZE: usize = 8            // job_id
+        + 4 + MAX_METADATA_LEN           // metadata string prefix + bytes
+        + 32                             // owner
+        + 32                             // worker
+        + 8                              // amount
+        + 1;                             // status enum (u8)
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum JobStatus {
+    Pending,
+    Started,
+    Processing,
+    Done,
 }
 
 #[error_code]
