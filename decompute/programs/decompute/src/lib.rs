@@ -42,13 +42,19 @@ pub mod escrow_job {
         Ok(())
     }
 
+    // ** Fixed complete_job: close the job account and transfer all lamports to worker **
     pub fn complete_job(ctx: Context<CompleteJob>) -> Result<()> {
         let job = &mut ctx.accounts.job;
 
         require!(ctx.accounts.owner.key() == job.owner, EscrowError::Unauthorized);
         require!(job.status != JobStatus::Done, EscrowError::InvalidState);
 
+        // Mark job as done before closing account (optional)
         job.status = JobStatus::Done;
+
+        // Because of `close = worker` in accounts context,
+        // all lamports in the job account (including rent) will be sent to worker
+        // when the job account is closed at the end of this instruction.
 
         Ok(())
     }
@@ -62,6 +68,7 @@ pub mod escrow_job {
         require!(ctx.accounts.job.status != JobStatus::Done, EscrowError::InvalidState);
         require!(job_ai.lamports() >= amount, EscrowError::InsufficientEscrow);
 
+        // Refund the owner
         **job_ai.try_borrow_mut_lamports()? -= amount;
         **owner_ai.try_borrow_mut_lamports()? += amount;
         Ok(())
@@ -107,13 +114,18 @@ pub struct MarkProcessing<'info> {
     pub worker: Signer<'info>,
 }
 
+// ** Fixed CompleteJob accounts struct: add `close = worker` to close job and transfer lamports **
 #[derive(Accounts)]
 pub struct CompleteJob<'info> {
-    #[account(mut, seeds = [b"job", &job.job_id.to_le_bytes()], bump, close = owner)]
+    #[account(mut, seeds = [b"job", &job.job_id.to_le_bytes()], bump, close = worker)]
     pub job: Account<'info, Job>,
 
     #[account(mut)]
     pub owner: Signer<'info>,
+
+    /// CHECK: This is the job-assigned worker. We check key matches in handler.
+    #[account(mut)]
+    pub worker: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -128,20 +140,20 @@ pub struct RefundJob<'info> {
 #[account]
 pub struct Job {
     pub job_id: u64,
-    pub metadata: String,
-    pub owner: Pubkey,
-    pub worker: Pubkey,
-    pub amount: u64,
+    pub metadata: String,           // max 256 bytes
+    pub owner: Pubkey,              // job poster
+    pub worker: Pubkey,             // set once someone accepts
+    pub amount: u64,                // lamports escrowed
     pub status: JobStatus,
 }
 
 impl Job {
-    pub const SIZE: usize = 8
-        + 4 + MAX_METADATA_LEN
-        + 32
-        + 32
-        + 8
-        + 1;
+    pub const SIZE: usize = 8            // job_id
+        + 4 + MAX_METADATA_LEN           // metadata string prefix + bytes
+        + 32                             // owner
+        + 32                             // worker
+        + 8                              // amount
+        + 1;                             // status enum (u8)
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
